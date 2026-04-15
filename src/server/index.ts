@@ -1,7 +1,14 @@
 import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
-import { query, get, run, transaction } from "./db";
+import { initDB, query, get, run } from "./db.js";
 
-const app = new OpenAPIHono();
+type Env = { Bindings: { DB: D1Database } };
+
+const app = new OpenAPIHono<Env>();
+
+app.use("*", async (c, next) => {
+  initDB(c.env.DB);
+  await next();
+});
 
 // ── DB Row Types ──────────────────────────────────────────────────
 
@@ -101,9 +108,9 @@ const getPage = createRoute({
 
 app.openapi(getPage, async (c) => {
   const { id } = c.req.valid("param");
-  const page = await get<PageRow>("SELECT * FROM pages WHERE id = ?", id);
+  const page = await get<PageRow>("SELECT * FROM pages WHERE id = ?", [id]);
   if (!page) return c.json({ error: "Page not found" }, 404);
-  const blocks = await query<BlockRow>("SELECT * FROM blocks WHERE page_id = ? ORDER BY position ASC", id);
+  const blocks = await query<BlockRow>("SELECT * FROM blocks WHERE page_id = ? ORDER BY position ASC", [id]);
   return c.json({ page, blocks }, 200);
 });
 
@@ -143,20 +150,20 @@ app.openapi(createPage, async (c) => {
 
     const maxPos = await get<{ max_pos: number }>(
       "SELECT COALESCE(MAX(position), -1) as max_pos FROM pages WHERE parent_id IS ?",
-      parentId
+      [parentId]
     );
     const nextPos = (maxPos?.max_pos ?? -1) + 1;
 
-    await run(
+    const result = await run(
       "INSERT INTO pages (title, parent_id, icon, position) VALUES (?, ?, ?, ?)",
-      title, parentId, icon, nextPos
+      [title, parentId, icon, nextPos]
     );
-    const inserted = await get<PageRow>("SELECT * FROM pages WHERE rowid = last_insert_rowid()");
+    const inserted = await get<PageRow>("SELECT * FROM pages WHERE rowid = ?", [result.lastInsertRowid]);
 
     if (inserted) {
       await run(
         "INSERT INTO blocks (page_id, type, content, position) VALUES (?, 'paragraph', '', 0)",
-        inserted.id
+        [inserted.id]
       );
     }
 
@@ -202,7 +209,7 @@ app.openapi(updatePage, async (c) => {
   try {
     const { id } = c.req.valid("param");
     const body = c.req.valid("json");
-    const existing = await get<PageRow>("SELECT * FROM pages WHERE id = ?", id);
+    const existing = await get<PageRow>("SELECT * FROM pages WHERE id = ?", [id]);
     if (!existing) return c.json({ error: "Page not found" }, 404);
 
     const fields: string[] = [];
@@ -218,10 +225,10 @@ app.openapi(updatePage, async (c) => {
     if (fields.length > 0) {
       fields.push("updated_at = datetime('now')");
       values.push(id);
-      await run(`UPDATE pages SET ${fields.join(", ")} WHERE id = ?`, ...values);
+      await run(`UPDATE pages SET ${fields.join(", ")} WHERE id = ?`, values);
     }
 
-    const updated = await get<PageRow>("SELECT * FROM pages WHERE id = ?", id);
+    const updated = await get<PageRow>("SELECT * FROM pages WHERE id = ?", [id]);
     return c.json(updated!, 200);
   } catch (err: unknown) {
     return c.json({ error: (err as Error).message }, 500);
@@ -244,7 +251,7 @@ const deletePage = createRoute({
 
 app.openapi(deletePage, async (c) => {
   const { id } = c.req.valid("param");
-  const result = await run("DELETE FROM pages WHERE id = ?", id);
+  const result = await run("DELETE FROM pages WHERE id = ?", [id]);
   if (result.changes === 0) return c.json({ error: "Page not found" }, 404);
   return c.json({ ok: true }, 200);
 });
@@ -287,23 +294,21 @@ const saveBlocks = createRoute({
 app.openapi(saveBlocks, async (c) => {
   try {
     const { id } = c.req.valid("param");
-    const page = await get<PageRow>("SELECT id FROM pages WHERE id = ?", id);
+    const page = await get<PageRow>("SELECT id FROM pages WHERE id = ?", [id]);
     if (!page) return c.json({ error: "Page not found" }, 404);
 
     const { blocks } = c.req.valid("json");
 
-    await transaction(async () => {
-      await run("DELETE FROM blocks WHERE page_id = ?", id);
-      for (let i = 0; i < blocks.length; i++) {
-        const b = blocks[i];
-        await run(
-          "INSERT INTO blocks (id, page_id, type, content, metadata, position) VALUES (?, ?, ?, ?, ?, ?)",
-          b.id || null, id, b.type, b.content, b.metadata || "{}", i
-        );
-      }
-    });
+    await run("DELETE FROM blocks WHERE page_id = ?", [id]);
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i];
+      await run(
+        "INSERT INTO blocks (id, page_id, type, content, metadata, position) VALUES (?, ?, ?, ?, ?, ?)",
+        [b.id || null, id, b.type, b.content, b.metadata || "{}", i]
+      );
+    }
 
-    const saved = await query<BlockRow>("SELECT * FROM blocks WHERE page_id = ? ORDER BY position ASC", id);
+    const saved = await query<BlockRow>("SELECT * FROM blocks WHERE page_id = ? ORDER BY position ASC", [id]);
     return c.json({ blocks: saved }, 200);
   } catch (err: unknown) {
     return c.json({ error: (err as Error).message }, 500);
@@ -343,23 +348,23 @@ const createBlock = createRoute({
 app.openapi(createBlock, async (c) => {
   try {
     const { id } = c.req.valid("param");
-    const page = await get<PageRow>("SELECT id FROM pages WHERE id = ?", id);
+    const page = await get<PageRow>("SELECT id FROM pages WHERE id = ?", [id]);
     if (!page) return c.json({ error: "Page not found" }, 404);
 
     const body = c.req.valid("json");
     const maxPos = await get<{ max_pos: number }>(
-      "SELECT COALESCE(MAX(position), -1) as max_pos FROM blocks WHERE page_id = ?", id
+      "SELECT COALESCE(MAX(position), -1) as max_pos FROM blocks WHERE page_id = ?", [id]
     );
     const position = body.position ?? ((maxPos?.max_pos ?? -1) + 1);
 
-    await run("UPDATE blocks SET position = position + 1 WHERE page_id = ? AND position >= ?", id, position);
+    await run("UPDATE blocks SET position = position + 1 WHERE page_id = ? AND position >= ?", [id, position]);
 
-    await run(
+    const result = await run(
       "INSERT INTO blocks (page_id, type, content, metadata, position) VALUES (?, ?, ?, ?, ?)",
-      id, body.type, body.content || "", body.metadata || "{}", position
+      [id, body.type, body.content || "", body.metadata || "{}", position]
     );
 
-    const inserted = await get<BlockRow>("SELECT * FROM blocks WHERE rowid = last_insert_rowid()");
+    const inserted = await get<BlockRow>("SELECT * FROM blocks WHERE rowid = ?", [result.lastInsertRowid]);
     return c.json(inserted!, 201);
   } catch (err: unknown) {
     return c.json({ error: (err as Error).message }, 500);
@@ -400,7 +405,7 @@ app.openapi(updateBlock, async (c) => {
     const { id } = c.req.valid("param");
     const body = c.req.valid("json");
 
-    const existing = await get<BlockRow>("SELECT * FROM blocks WHERE id = ?", id);
+    const existing = await get<BlockRow>("SELECT * FROM blocks WHERE id = ?", [id]);
     if (!existing) return c.json({ error: "Block not found" }, 404);
 
     const fields: string[] = [];
@@ -413,10 +418,10 @@ app.openapi(updateBlock, async (c) => {
     if (fields.length > 0) {
       fields.push("updated_at = datetime('now')");
       values.push(id);
-      await run(`UPDATE blocks SET ${fields.join(", ")} WHERE id = ?`, ...values);
+      await run(`UPDATE blocks SET ${fields.join(", ")} WHERE id = ?`, values);
     }
 
-    const updated = await get<BlockRow>("SELECT * FROM blocks WHERE id = ?", id);
+    const updated = await get<BlockRow>("SELECT * FROM blocks WHERE id = ?", [id]);
     return c.json(updated!, 200);
   } catch (err: unknown) {
     return c.json({ error: (err as Error).message }, 500);
@@ -439,7 +444,7 @@ const deleteBlock = createRoute({
 
 app.openapi(deleteBlock, async (c) => {
   const { id } = c.req.valid("param");
-  const result = await run("DELETE FROM blocks WHERE id = ?", id);
+  const result = await run("DELETE FROM blocks WHERE id = ?", [id]);
   if (result.changes === 0) return c.json({ error: "Block not found" }, 404);
   return c.json({ ok: true }, 200);
 });
